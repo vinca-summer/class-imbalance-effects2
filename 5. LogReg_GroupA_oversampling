@@ -1,0 +1,223 @@
+# Employ oversampling to supplement the minority group and evaluate Logistic Regression classification performance.  
+# Simulate 4000 samples with 50 features, introducing a small mean shift for Group B.  
+# Select 500 samples from Group A and all samples from Group B for training and testing.  
+# Iterate through 91 configurations, adjusting the training and test set sizes dynamically.  
+# Sample training and test sets separately for Group A and Group B in each iteration.  
+# Apply oversampling to balance Group A with Group B in the training set.  
+# Train a logistic regression model on the balanced training data.  
+# Predict on the test set and compute confusion matrix and AUC scores.  
+# Aggregate iteration results and compute accuracy, precision, recall, and F1 score.  
+# Summarize results across configurations, calculating classification percentages.  
+
+
+
+library(dplyr)
+library(openxlsx)
+library(pROC)
+library(ggplot2)
+
+
+# Set parameters
+n_samples <- 4000  # Total number of samples (2000 per group)
+n_features <- 50   # Number of features
+set.seed(123)      # Set seed for reproducibility
+
+# Create binary group variable
+group <- rep(c("A", "B"), each = 2000)
+
+# Simulate features with slight mean shift for Group B
+features <- matrix(rnorm(n_samples * n_features, mean = as.numeric(group == "B") * 0.3, sd = 1.2), 
+                   nrow = n_samples, ncol = n_features)
+
+# Combine into a dataframe
+data_full <- data.frame(group = factor(group, levels = c("A", "B")), features)
+
+# Use only the last 2500 samples
+data <- data_full[1501:nrow(data_full), ]
+
+# Initialize results dataframe
+all_results <- data.frame()
+num_outer_iterations <- 10  # Number of outer iterations
+
+for (outer_iter in 1:num_outer_iterations) {
+    cat("Starting outer iteration:", outer_iter, "\n")
+    
+    # Identify group indices
+    group_A_indices <- which(data$group == "A")
+    group_B_indices <- which(data$group == "B")
+    
+    # Sliding window parameters
+    initial_size <- 500
+    step_size <- 5
+    num_configs <- 91
+    
+    for (idx in seq_len(num_configs)) {
+        cat("  Starting configuration:", idx, "\n")
+        
+        # Define test set sizes
+        group_A_test_size <- 100 - (idx - 1)
+        group_B_test_size <- 100 + (idx - 1)
+        
+        # Sample training and test sets
+        group_A_train <- sample(group_A_indices, size = floor(0.8 * (initial_size - (idx - 1) * step_size)))
+        group_A_test <- setdiff(group_A_indices, group_A_train)[1:group_A_test_size]
+        
+        group_B_subset <- group_B_indices[1:(initial_size + (idx - 1) * step_size)]
+        group_B_train <- sample(group_B_subset, size = floor(0.8 * length(group_B_subset)))
+        group_B_test <- setdiff(group_B_subset, group_B_train)[1:group_B_test_size]
+        
+        # Prepare training and testing data
+        train_data <- data[c(group_A_train, group_B_train), ]
+        test_data <- data[c(group_A_test, group_B_test), ]
+        
+        # Convert group labels to binary (0 = A, 1 = B)
+        train_data$group <- as.numeric(train_data$group == "B")
+        test_data$group <- as.numeric(test_data$group == "B")
+        
+        # Oversample Group A to balance training set
+        diff_size <- sum(train_data$group == 1) - sum(train_data$group == 0)
+        if (diff_size > 0) {
+            oversampled_A <- train_data[train_data$group == 0, ][sample(1:sum(train_data$group == 0), diff_size, replace = TRUE), ]
+            train_data <- rbind(train_data, oversampled_A)
+        }
+        
+        # Train logistic regression model
+        logit_model <- glm(group ~ ., data = train_data, family = binomial)
+        
+        # Make predictions
+        test_probabilities <- predict(logit_model, newdata = test_data, type = "response")
+        test_predictions <- ifelse(test_probabilities > 0.5, 1, 0)
+        
+        # Compute confusion matrix
+        conf_matrix <- table(Predicted = test_predictions, Actual = test_data$group)
+        
+        # Extract values from confusion matrix
+        conf_values <- c(
+            conf_matrix["0", "0"], conf_matrix["1", "0"],
+            conf_matrix["0", "1"], conf_matrix["1", "1"]
+        )
+        conf_values[is.na(conf_values)] <- 0
+        
+        # Compute AUC
+        auc_test <- auc(roc(test_data$group, test_probabilities))
+        
+        # Record results
+        all_results <- rbind(all_results, data.frame(
+            outer_iteration = outer_iter,
+            group_A_train = length(group_A_train),
+            group_B_train = length(group_B_train),
+            total_test_A = length(group_A_test),
+            total_test_B = length(group_B_test),
+            test_cm_A_A = conf_values[1],
+            test_cm_A_B = conf_values[2],
+            test_cm_B_A = conf_values[3],
+            test_cm_B_B = conf_values[4],
+            auc_test = auc_test
+        ))
+    }
+}
+
+# Compute performance metrics
+all_results <- all_results %>%
+    mutate(
+        accuracy_test = (test_cm_A_A + test_cm_B_B) / (test_cm_A_A + test_cm_A_B + test_cm_B_A + test_cm_B_B),
+        precision_test = test_cm_A_A / (test_cm_A_A + test_cm_B_A),
+        recall_test = test_cm_A_A / (test_cm_A_A + test_cm_A_B),
+        f1_score_test = 2 * (precision_test * recall_test) / (precision_test + recall_test)
+    )
+
+# Save results to Excel
+write.xlsx(all_results, "test_LR_just_oversampling_raw.xlsx")
+
+# Summary of results
+results_summary <- all_results %>%
+    group_by(group_A_train) %>%
+    summarise(
+        group_B_train = mean(group_B_train),
+        total_test_A = mean(total_test_A),
+        total_test_B = mean(total_test_B),
+        test_cm_A_A = round(mean(test_cm_A_A), 1),
+        test_cm_A_B = round(mean(test_cm_A_B), 1),
+        test_cm_B_A = round(mean(test_cm_B_A), 1),
+        test_cm_B_B = round(mean(test_cm_B_B), 1),
+        accuracy_test = mean(accuracy_test),
+        precision_test = mean(precision_test),
+        recall_test = mean(recall_test),
+        f1_score_test = mean(f1_score_test),
+        auc_test = mean(auc_test)
+    ) %>%
+    ungroup()
+
+results_summary$Percent_A_to_all <- 100 * (results_summary$group_A_train + results_summary$total_test_A) / 
+    (results_summary$group_A_train + results_summary$group_B_train + results_summary$total_test_A + results_summary$total_test_B)
+results_summary$Percent_true_A <- round(100 * results_summary$test_cm_A_A / results_summary$total_test_A, 1)
+results_summary$Percent_true_B <- round(100 * results_summary$test_cm_B_B / results_summary$total_test_B, 1)
+
+# Save summary results
+write.xlsx(results_summary, "test_LR_just_oversampling_averaged.xlsx")
+
+# Plotting
+xxx <- read.xlsx("test_LR_just_oversampling_averaged.xlsx")
+
+ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = Percent_true_A, color = "A")) +
+    geom_line(aes(y = Percent_true_B, color = "B")) +
+    scale_color_manual(
+        values = c("A" = "red", "B" = "blue"),
+        labels = c("Group A", "Group B")
+    ) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "Percent Correctly Identified Samples", 
+         color = NULL,  # Suppress legend title
+         title = "Group A Supplemented with Oversampling, LR") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 9), axis.title.y = element_text(size = 8)) +
+    # Vertical dashed lines in purple that stop at Percent_true_A
+    geom_segment(aes(x = 40, xend = 40, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]), 
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 45, xend = 45, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]), 
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 50, xend = 50, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]), 
+                 linetype = "dashed", color = "purple") +
+    # Horizontal dashed lines in purple from y-axis to the intersection points
+    geom_segment(aes(x = 0, xend = 40, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 40))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]),
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 0, xend = 45, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 45))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]),
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 0, xend = 50, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 50))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]),
+                 linetype = "dashed", color = "purple")
+
+
+ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = accuracy_test, color = "accuracy_test")) +
+    geom_line(aes(y = precision_test, color = "precision_test")) +
+    geom_line(aes(y = recall_test, color = "recall_test")) +
+    geom_line(aes(y = f1_score_test, color = "f1_score_test")) +
+    geom_line(aes(y = auc_test, color = "auc_test")) +
+    scale_color_manual(values = c("accuracy_test" = "blue", 
+                                  "precision_test" = "red", 
+                                  "recall_test" = "green", 
+                                  "f1_score_test" = "purple", 
+                                  "auc_test" = "orange"),
+        labels = c("Accuracy", "AUC", "f1 Score", "Precision", "Recall")
+    ) +
+    ylim(0, NA) +  
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 9)) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "", 
+         color = NULL, 
+         title = "Group A Supplemented with Oversampling, LR")
+
