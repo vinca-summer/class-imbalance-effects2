@@ -1,0 +1,257 @@
+# ROSE adds synthetic samples to minority Group A  
+# Train-test splits adjust dynamically per iteration  
+# Sliding window controls training and test set sizes  
+# Synthetic samples increase progressively across iterations  
+# Logistic Regression model trains on augmented datasets  
+# Test set evaluates classification performance  
+# Confusion matrix and AUC scores are computed  
+# Performance metrics include accuracy and F1-score  
+# Seed ensures reproducibility in sampling  
+# Final results track ROSE’s effect on classification  
+
+
+
+library(dplyr)
+library(openxlsx)
+library(pROC)
+library(ROSE)
+library(ggplot2)
+
+# Set parameters
+n_samples <- 4000  # Total number of samples (2000 for Group_A, 2000 for Group_B)
+n_features <- 50   # Number of features
+
+# Create a binary group variable (2000 samples of A and 2000 samples of B)
+group <- c(rep("A", 2000), rep("B", 2000))
+
+set.seed(123)  # Ensure reproducibility
+
+# Simulate 50 features with a subtle mean difference and moderate noise
+features <- matrix(rnorm(n_samples * n_features, 
+                         mean = as.numeric(group == "B") * 0.3, 
+                         sd = 1.2), 
+                   nrow = n_samples, 
+                   ncol = n_features)
+
+# Combine into a dataframe
+data_full <- data.frame(group = factor(group, levels = c("A", "B")), features)
+
+# Define the subset of data to be used
+data <- data_full[1501:nrow(data_full), ]
+
+# Initialize results dataframe
+all_results <- data.frame()
+
+# Outer loop parameters
+num_outer_iterations <- 10
+initial_size <- 500
+step_size <- 5
+num_configs <- 91
+initial_test_A_size <- 100
+initial_test_B_size <- 100
+
+# Outer loop for synthetic sample generation and model evaluation
+for (outer_iter in 1:num_outer_iterations) {
+    
+    # Get indices for Group A and Group B
+    group_A_indices <- which(data$group == "A")
+    group_B_indices <- which(data$group == "B")
+    
+    for (idx in seq_len(num_configs)) {
+        
+        # Calculate test set sizes
+        group_A_test_size <- initial_test_A_size - (idx - 1)
+        group_B_test_size <- initial_test_B_size + (idx - 1)
+        
+        # Train-test split for Group A
+        group_A_train <- sample(group_A_indices, size = floor(0.8 * (initial_size - (idx - 1) * step_size)))
+        remaining_A <- setdiff(group_A_indices, group_A_train)
+        group_A_test <- head(remaining_A, group_A_test_size)
+        
+        # Train-test split for Group B
+        group_B_subset <- head(group_B_indices, initial_size + (idx - 1) * step_size)
+        group_B_train <- sample(group_B_subset, size = floor(0.8 * (initial_size + (idx - 1) * step_size)))
+        group_B_test <- head(setdiff(group_B_subset, group_B_train), group_B_test_size)
+        
+        # Combine training and testing indices
+        train_indices <- c(group_A_train, group_B_train)
+        test_indices <- c(group_A_test, group_B_test)
+        
+        # Split the data into training and testing sets
+        train_data <- data[train_indices, ]
+        test_data <- data[test_indices, ]
+        
+        # Convert group to numeric for logistic regression if not first iteration
+        if (outer_iter > 1 || idx > 1) {
+            train_data$group <- as.numeric(train_data$group == "B")
+            test_data$group <- as.numeric(test_data$group == "B")
+        }
+        
+        # Synthetic sample generation using ROSE
+        if (outer_iter > 1 || idx > 1) {
+            N_dynamic <- 1000
+            rose_output <- ROSE(group ~ ., data = train_data, N = N_dynamic, p = 0.5, seed = sample.int(1e5, 1))$data
+            rose_output_A <- rose_output[rose_output$group == 0, ]
+            
+            synthetic_samples_to_add <- 8 * (idx - 1)
+            
+            if (nrow(rose_output_A) >= synthetic_samples_to_add) {
+                rose_output_A_selected <- rose_output_A[sample(nrow(rose_output_A), synthetic_samples_to_add), ]
+                train_data <- rbind(train_data, rose_output_A_selected)
+            }
+        } else {
+            synthetic_samples_to_add <- 0
+        }
+        
+        # Convert group back to factor after synthetic sample addition
+        if (outer_iter > 1 || idx > 1) {
+            train_data$group <- factor(train_data$group, labels = c("A", "B"))
+            test_data$group <- factor(test_data$group, labels = c("A", "B"))
+        }
+        
+        # Logistic regression model
+        logit_model <- glm(group ~ ., data = train_data, family = binomial)
+        
+        # Predictions and probabilities for the test set
+        test_probabilities <- predict(logit_model, newdata = test_data, type = "response")
+        test_predictions <- factor(ifelse(test_probabilities > 0.5, "B", "A"), levels = c("A", "B"))
+        
+        # Confusion matrix and evaluation metrics
+        test_conf_matrix <- table(Predicted = test_predictions, Actual = test_data$group)
+        
+        extract_conf_matrix_values <- function(conf_matrix) {
+            AA <- ifelse("A" %in% rownames(conf_matrix) && "A" %in% colnames(conf_matrix), conf_matrix["A", "A"], 0)
+            AB <- ifelse("B" %in% rownames(conf_matrix) && "A" %in% colnames(conf_matrix), conf_matrix["B", "A"], 0)
+            BA <- ifelse("A" %in% rownames(conf_matrix) && "B" %in% colnames(conf_matrix), conf_matrix["A", "B"], 0)
+            BB <- ifelse("B" %in% rownames(conf_matrix) && "B" %in% colnames(conf_matrix), conf_matrix["B", "B"], 0)
+            return(c(AA, AB, BA, BB))
+        }
+        
+        conf_values_test <- extract_conf_matrix_values(test_conf_matrix)
+        
+        # AUC for the test set
+        roc_obj <- roc(test_data$group, test_probabilities)
+        auc_test <- auc(roc_obj)
+        
+        # Store iteration results
+        iteration_results <- data.frame(
+            outer_iteration = outer_iter,
+            group_A_train = length(group_A_train),
+            group_B_train = length(group_B_train),
+            total_test_A = length(group_A_test),
+            total_test_B = length(group_B_test),
+            test_cm_A_A = conf_values_test[1],
+            test_cm_A_B = conf_values_test[2],
+            test_cm_B_A = conf_values_test[3],
+            test_cm_B_B = conf_values_test[4],
+            auc_test = auc_test,
+            synthetic_samples_to_add = synthetic_samples_to_add
+        )
+        
+        all_results <- rbind(all_results, iteration_results)
+    }
+}
+
+# Calculate performance metrics
+all_results <- all_results %>%
+    mutate(
+        accuracy_test = (test_cm_A_A + test_cm_B_B) / (test_cm_A_A + test_cm_A_B + test_cm_B_A + test_cm_B_B),
+        precision_test = test_cm_A_A / (test_cm_A_A + test_cm_B_A),
+        recall_test = test_cm_A_A / (test_cm_A_A + test_cm_A_B),
+        f1_score_test = 2 * (precision_test * recall_test) / (precision_test + recall_test)
+    )
+
+# Save raw results
+write.xlsx(all_results, "test_LR_ROSE_raw.xlsx")
+
+# Summary of results
+results_summary <- all_results %>%
+    group_by(group_A_train) %>%
+    summarise(
+        group_B_train = mean(group_B_train),
+        total_test_A = mean(total_test_A),
+        total_test_B = mean(total_test_B),
+        test_cm_A_A = round(mean(test_cm_A_A), 1),
+        test_cm_A_B = round(mean(test_cm_A_B), 1),
+        test_cm_B_A = round(mean(test_cm_B_A), 1),
+        test_cm_B_B = round(mean(test_cm_B_B), 1),
+        accuracy_test = mean(accuracy_test),
+        precision_test = mean(precision_test),
+        recall_test = mean(recall_test),
+        f1_score_test = mean(f1_score_test),
+        auc_test = mean(auc_test)
+    ) %>%
+    ungroup()
+
+results_summary$Percent_A_to_all <- 100 * (results_summary$group_A_train + results_summary$total_test_A) / 
+    (results_summary$group_A_train + results_summary$group_B_train + results_summary$total_test_A + results_summary$total_test_B)
+results_summary$Percent_true_A <- round(100 * results_summary$test_cm_A_A / results_summary$total_test_A, 1)
+results_summary$Percent_true_B <- round(100 * results_summary$test_cm_B_B / results_summary$total_test_B, 1)
+
+# Save summary results
+write.xlsx(results_summary, "test_LR_ROSE_averaged.xlsx")
+
+
+xxx <- read.xlsx("test_LR_ROSE_averaged.xlsx")
+
+ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = Percent_true_A, color = "A")) +
+    geom_line(aes(y = Percent_true_B, color = "B")) +
+    scale_color_manual(
+        values = c("A" = "red", "B" = "blue"),
+        labels = c("Group A", "Group B")
+    ) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "Percent Correctly Identified Samples", 
+         color = NULL,  # Suppress legend title
+         title = "Group A Supplemented with ROSE Synthetic Samples, LR") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 9), axis.title.y = element_text(size = 8)) +
+    # Vertical dashed lines in purple that stop at Percent_true_A
+    geom_segment(aes(x = 40, xend = 40, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]), 
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 45, xend = 45, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]), 
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 50, xend = 50, 
+                     y = 0, 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]), 
+                 linetype = "dashed", color = "purple") +
+    # Horizontal dashed lines in purple from y-axis to the intersection points
+    geom_segment(aes(x = 0, xend = 40, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 40))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 40))]),
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 0, xend = 45, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 45))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 45))]),
+                 linetype = "dashed", color = "purple") +
+    geom_segment(aes(x = 0, xend = 50, 
+                     y = Percent_true_A[which.min(abs(Percent_A_to_all - 50))], 
+                     yend = Percent_true_A[which.min(abs(Percent_A_to_all - 50))]),
+                 linetype = "dashed", color = "purple")
+
+
+ggplot(xxx, aes(x = Percent_A_to_all)) +
+    geom_line(aes(y = accuracy_test, color = "accuracy_test")) +
+    geom_line(aes(y = precision_test, color = "precision_test")) +
+    geom_line(aes(y = recall_test, color = "recall_test")) +
+    geom_line(aes(y = f1_score_test, color = "f1_score_test")) +
+    geom_line(aes(y = auc_test, color = "auc_test")) +
+    scale_color_manual(values = c("accuracy_test" = "blue", 
+                                  "precision_test" = "red", 
+                                  "recall_test" = "green", 
+                                  "f1_score_test" = "purple", 
+                                  "auc_test" = "orange"),
+        labels = c("Accuracy", "AUC", "f1 Score", "Precision", "Recall")
+    ) +
+    ylim(0, NA) +  
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 9)) +
+    labs(x = "Percent of Group A in Total Data", 
+         y = "", 
+         color = NULL, 
+         title = "Group A Supplemented with ROSE Synthetic Samples, LR")
